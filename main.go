@@ -44,17 +44,17 @@ func main() {
 	socraticProxy := httputil.NewSingleHostReverseProxy(socraticTarget)
 	examPreproxy := httputil.NewSingleHostReverseProxy(examPrepTarget)
 
-	originalDirector := examPreproxy.Director
+	examprepDirector := examPreproxy.Director
 
 	//定义stuudy-traker的对外路径
 	examprepPath := "/api/examprep/"
 
 	examPreproxy.Director = func(req *http.Request) {
-		originalDirector(req)
+		examprepDirector(req)
 		req.Host = examPrepTarget.Host
 
 		oldProfix := examprepPath
-		newProfix := "/api"
+		newProfix := "/api/"
 
 		if strings.HasPrefix(req.URL.Path, oldProfix) {
 			req.URL.Path = newProfix + req.URL.Path[len(oldProfix):]
@@ -65,15 +65,17 @@ func main() {
 		}
 	}
 
+	socraticDirector := socraticProxy.Director
+
 	//定义socratic服务的对外路径
 	socraticPath := "/api/socratic/"
 
 	socraticProxy.Director = func(req *http.Request) {
-		originalDirector(req)
+		socraticDirector(req)
 		req.Host = socraticTarget.Host
 
 		oldProfix := socraticPath
-		newProfix := "/api/v1/socratic"
+		newProfix := "/api/v1/socratic/"
 
 		if strings.HasPrefix(req.URL.Path, oldProfix) {
 			req.URL.Path = newProfix + req.URL.Path[len(oldProfix):]
