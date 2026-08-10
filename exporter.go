@@ -2,25 +2,11 @@ package main
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"sync/atomic"
 )
 
 func MetricsHandler(w http.ResponseWriter, r *http.Request) {
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte("403 Forbidden"))
-		return
-	}
-	if host != "127.0.0.1" && host != "::1" {
-		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte("403 Forbidden"))
-		return
-	}
-
 	reqs := atomic.LoadUint64(&GlobalMetrics.TotalRequests)
 	errs := atomic.LoadUint64(&GlobalMetrics.TotalErrors)
 	durationms := atomic.LoadUint64(&GlobalMetrics.TotalDurationMs)
