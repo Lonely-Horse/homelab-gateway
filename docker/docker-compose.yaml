@@ -1,0 +1,16 @@
+services:
+  homelab-telemetry:
+    image: 100.87.250.21:5000/homelab-telemetry:latest
+    container_name: homelab-telemetry
+    ports:
+      - "8085:8085"
+    environment:
+      - SOCRATIC_TUTOR_URL=http://socratic-tutor:8083
+      - EXAM_PREP_URL=http://study-traker:8082
+    networks:
+      - dify_net
+    restart: unless-stopped
+networks:
+  dify_net:
+    external: true
+    name: docker_default
