@@ -2,11 +2,11 @@
 
 | 项 | 内容 |
 |---|---|
-| 版本 | v0.2（配置契约修订：listen / server / upstream 主机名） |
-| 日期 | 2026-10-22 |
-| 状态 | 阶段 1 实现中（config 契约已冻结） |
-| 语言 | Go，仅标准库 |
-| 代码位置 | 在 `homelab-telemetry` 仓库内继续开发，模块名沿用 |
+| 版本 | v0.3（配置契约冻结；撤销默认值 / WARN 通道） |
+| 日期 | 2026-10-24 |
+| 状态 | 阶段 1 已完成；阶段 2（router）待开始 |
+| 语言 | Go 1.24（标准库）+ `go.yaml.in/yaml/v3`（唯一外部依赖） |
+| 代码位置 | 独立仓库 `homelab-gateway`，模块名 `homelab-gateway` |
 
 ---
 
@@ -101,8 +101,6 @@ homelab-gateway/
         └── metrics.go           # 手写 Prometheus 文本格式
 ```
 
-**包大小约束：每个包 < 200 行。超过说明职责混了。**
-
 ---
 
 ## 4. 配置规范
@@ -126,7 +124,7 @@ routes:
   - name: blog
     host: blog.example.com
     upstream: "http://127.0.0.1:8080"
-    health: "/healthz"
+    health: "/healthz"            # 保留字段，v0.1 不使用
 
   - name: grafana
     path_prefix: "/grafana/"
@@ -149,19 +147,23 @@ routes:
 | `routes[].name` | string | ✅ | 唯一，用作指标和日志的标签 |
 | `routes[].host` | string | ❌ | 精确匹配 `r.Host`，为空表示不限制 |
 | `routes[].path_prefix` | string | ❌ | 前缀匹配，为空表示不限制 |
-| `routes[].upstream` | string | ✅ | 完整 URL（含 scheme）；IP 必须在内网段，主机名放行并在启动时告警 |
+| `routes[].upstream` | string | ✅ | 完整 URL（含 scheme）；host 为 IP 字面量时必须在内网段，主机名不做加载期校验 |
 | `routes[].strip_prefix` | bool | ❌ | 转发前是否剥掉 `path_prefix` |
-| `routes[].health` | string | ❌ | 健康检查路径（v0.1 仅用于文档，不主动轮询） |
+| `routes[].health` | string | ❌ | 保留字段：v0.1 解析但**完全不使用**（不轮询、不影响转发），不要指望它生效 |
 
 ### 4.3 校验规则（加载时全部检查，失败即退出）
 
 1. `listen` 不为空，可 `net.SplitHostPort`，端口在 1–65535（允许 `0.0.0.0`）
 2. `routes` 非空
 3. 每个 `route.name` 唯一
-4. 每个 `route.upstream` 能被 `url.Parse` 且 scheme 为 `http`/`https`
-5. `upstream` 是 IP 字面量时，必须在内网段（10/8、172.16/12、192.168/16、127/8、100.64/10、fc00::/7）；是主机名时不做加载期校验，启动时打印 WARN
+4. 每个 `route.upstream` 能被 `url.Parse` 且 scheme 为 `http`/`https`，host 非空
+5. `upstream` 的 host 为 IP 字面量时，必须在内网段（10/8、172.16/12、192.168/16、127/8、100.64/10、fc00::/7），否则报错；host 为主机名时不做加载期校验（解析失败、连不上都留到运行期，表现为 502）
 6. `strip_prefix` 为 true 时，`path_prefix` 不能为空
-7. `timeouts` 与 `server` 下的六条超时都必须 > 0
+7. 六条超时都必须 `> 0`（配置里缺省即为 0，等同于写 0，一并报错）
+8. `route.upstream` 不得指向网关自身监听地址（同端口 + 本机地址）：
+   - 端口相同（`upstream` 未写端口时按 scheme 取默认：`http`=80、`https`=443）
+   - 且 host 为以下任一：回环地址（`127.0.0.0/8`、`::1`）、通配地址（`0.0.0.0`、`::`）、`localhost`（大小写不敏感）、与 `listen` 的 host 字面相同
+   - 判定失败时报 `routes[i].upstream`
 
 **校验失败的输出必须包含具体行号和字段名**，不能只说 "invalid config"。
 
@@ -254,12 +256,12 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request)
 conn accepted
   │
   ▼
-http.Server（ReadTimeout / IdleTimeout）
+http.Server（ReadHeaderTimeout / IdleTimeout）
   │
   ▼
 rootHandler
   │
-  ├─ 1. rec := &statusRecorder{ResponseWriter: w, status: 200}
+  ├─ 1. rec := &statusRecorder{ResponseWriter: w}   // status 零值 = 0，表示"还没写过"
   ├─ 2. start := time.Now()
   ├─ 3. defer func() {
   │         dur := time.Since(start)
@@ -274,7 +276,7 @@ rootHandler
   ▼
 ReverseProxy
   │
-  ├─ Director: 改写 URL（scheme / host / path）
+  ├─ Rewrite: SetURL(target) + SetXForwarded() + 可选剥前缀
   ├─ Transport: DialContext(3s) + ResponseHeaderTimeout(10s)
   │
   ▼
@@ -307,20 +309,20 @@ rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 
 ### 7.1 每个 route 一个 ReverseProxy 实例
 
-**问题**：全局单实例时，`Director` 无法知道"当前请求属于哪个上游"。
+**问题**：全局单实例时，改写函数无法知道"当前请求属于哪个上游"。
 
 **错误做法**：
 
 ```go
 var globalProxy = &httputil.ReverseProxy{
-    Director: func(req *http.Request) {
+    Rewrite: func(pr *httputil.ProxyRequest) {
         // 只能从 context 挖，或从全局 map 里按 Host 反查
         // → 并发下极易出错
     },
 }
 ```
 
-**正确做法**：
+**正确做法**（用 `Rewrite`，理由见下方实测）：
 
 ```go
 func New(route *Route, t Timeouts, shared *http.Transport) *Proxy {
@@ -328,21 +330,16 @@ func New(route *Route, t Timeouts, shared *http.Transport) *Proxy {
     prefix := route.PathPrefix
 
     rp := &httputil.ReverseProxy{
-        Director: func(req *http.Request) {
-            req.URL.Scheme = target.Scheme
-            req.URL.Host = target.Host
-            req.Host = target.Host
+        Rewrite: func(pr *httputil.ProxyRequest) {
+            pr.SetURL(target)     // scheme / host / Host 头，一次搞定
+            pr.SetXForwarded()    // 重建 X-Forwarded-For / -Host / -Proto
+
             if route.StripPrefix {
-                req.URL.Path = strings.TrimPrefix(req.URL.Path, prefix)
-                if req.URL.Path == "" {
-                    req.URL.Path = "/"
+                pr.Out.URL.Path = strings.TrimPrefix(pr.Out.URL.Path, prefix)
+                if pr.Out.URL.Path == "" {
+                    pr.Out.URL.Path = "/"
                 }
             }
-            // 重写转发头（不信任客户端传的）
-            if ip, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
-                req.Header.Set("X-Forwarded-For", ip)
-            }
-            req.Header.Set("X-Forwarded-Proto", "http") // 内层是 http
         },
         Transport: shared,
     }
@@ -352,9 +349,9 @@ func New(route *Route, t Timeouts, shared *http.Transport) *Proxy {
 
 **关键点**：
 
-- `Director` 是并发调用的，闭包捕获自己的 `target` 和 `prefix`，无共享状态
+- `Rewrite` 是并发调用的，闭包捕获自己的 `target` 和 `prefix`，无共享状态
 - `Transport` 可以共享（它是并发安全的），这样连接池复用
-- `X-Forwarded-For` **覆盖而非追加**（不信任客户端）
+- **不用 `Director`**：实测在 `Director` 里 `Set("X-Forwarded-For", ip)`，上游收到的是 `"127.0.0.1, 127.0.0.1"`——库在 `Director` 返回之后又追加了一次真实 IP。`Rewrite` 路径会先删掉入站的 `Forwarded` / `X-Forwarded-*`，再由 `SetXForwarded` 重建，客户端伪造值进不来，`X-Forwarded-Host` 也自动填好
 
 ### 7.2 statusRecorder 会杀掉 SSE（必须透传 Flusher）
 
@@ -400,9 +397,15 @@ func (r *statusRecorder) Flush() {
         f.Flush()
     }
 }
+
+// Go 1.24 的更省事做法：给包装器实现 Unwrap，ResponseController（ReverseProxy 内部用它
+// 做 Flush / Hijack）会自动沿 Unwrap 链找到下层的真实 ResponseWriter。
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+    return r.ResponseWriter
+}
 ```
 
-**通用规则**：每包装一层 `ResponseWriter`，就要把 `Flusher`、`Hijacker`、`ReaderFrom` 这些可选接口手动透传一遍。少一个，就有一个功能静默失效。
+**通用规则**：包装 `ResponseWriter` 时，优先实现 `Unwrap()`，让 `http.ResponseController` 帮你找到下层的 `Flush` / `Hijack`；只有当调用方**直接做接口断言**（`w.(http.Flusher)`）时，才需要逐个显式透传。
 
 ### 7.3 超时必须由内向外递增
 
@@ -639,7 +642,7 @@ curl http://gw:8080/grafana/api/health                  → 打到 grafana，且
 | `server_name blog.example.com;` | `routes[].host` | 精确匹配 |
 | `location /grafana/` | `routes[].path_prefix` | 前缀匹配 |
 | `proxy_pass http://127.0.0.1:3000;` | `routes[].upstream` | — |
-| `proxy_set_header X-Forwarded-For` | `Director` 内自动重写 | 覆盖而非追加 |
+| `proxy_set_header X-Forwarded-For` | `Rewrite` 内 `SetXForwarded()` | 先删入站伪造值，再重建；覆盖而非追加 |
 | `proxy_read_timeout` | `timeouts.response_header` | — |
 | `proxy_buffering off;` | 天然无缓冲（直接转发） | Go 的实现不引入额外缓冲 |
 | `access_log` | `accesslog` 包 | JSON 格式 |

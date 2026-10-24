@@ -43,15 +43,9 @@ type Config struct {
 	Routes   []Route        `yaml:"routes"`
 }
 
-type FileError struct {
-	Path   string
-	Reason string
-	line   int
-}
-
 type lineIndex map[string]int
 
-// 这里的collection处理的是顶层的doument的外壳
+// collectLines 剥掉顶层 Document 外壳，再用 walk 建立“字段路径 → 所在行号”索引
 func collectLines(root *yaml.Node) lineIndex {
 	idx := lineIndex{}
 	if root == nil {
@@ -72,7 +66,7 @@ func collectLines(root *yaml.Node) lineIndex {
 func walk(n *yaml.Node, prefix string, idx lineIndex) {
 	switch n.Kind {
 	case yaml.MappingNode:
-		for i := 0; i+1 < len((n.Content)); i += 2 {
+		for i := 0; i+1 < len(n.Content); i += 2 {
 			key, val := n.Content[i], n.Content[i+1]
 			path := key.Value
 			if prefix != "" {
@@ -100,27 +94,142 @@ type FieldError struct {
 
 func (e *FieldError) Error() string {
 	var b strings.Builder
-	b.WriteString(`"<`)
 	b.WriteString(e.File)
-	if e.Line == 0 {
-		b.WriteString(">: ")
-	} else {
-		b.WriteString(">:<")
+	b.WriteString(":")
+	if e.Line != 0 {
 		b.WriteString(strconv.FormatInt(int64(e.Line), 10))
-		b.WriteString(">: <")
+		b.WriteString(": ")
 	}
 	b.WriteString(e.Path)
-	b.WriteString(">: <")
+	b.WriteString(": ")
 	b.WriteString(e.Reason)
-	b.WriteString(`>"`)
 
-	err := b.String()
-	return err
+	return b.String()
 }
 
 var cgnat = &net.IPNet{
 	IP:   net.IPv4(100, 64, 0, 0),
 	Mask: net.CIDRMask(10, 32),
+}
+
+type addFunc func(path, format string, a ...any)
+
+func (c *Config) validateListen(add addFunc) (string, int) {
+	var listenHost string
+	var listenPort int
+
+	if c.Listen == "" {
+		add("listen", "must not be empty")
+	} else if host, portstr, err := net.SplitHostPort(c.Listen); err != nil {
+		add("listen", "must be host:port, got %q", c.Listen)
+	} else if port, err := strconv.Atoi(portstr); err != nil {
+		add("listen", "port %q is not a number", portstr)
+	} else if port < 1 || port > 65535 {
+		add("listen", "port %d out of range 1-65535", port)
+	} else {
+		listenHost, listenPort = host, port
+	}
+
+	return listenHost, listenPort
+}
+
+func (c *Config) validateRoutes(host string, port int, add addFunc) {
+	if len(c.Routes) == 0 {
+		add("routes", "at least one route is required")
+	}
+
+	lip := net.ParseIP(host)
+	listenCatchesLoopback := host == "" || (lip != nil && (lip.IsUnspecified() || lip.IsLoopback())) || strings.EqualFold(host, "localhost")
+	seen := make(map[string]int, len(c.Routes))
+	for i, rt := range c.Routes {
+		base := fmt.Sprintf("routes[%d]", i)
+
+		if rt.Name == "" {
+			add(base+".name", "must not be empty")
+		} else if first, ok := seen[rt.Name]; ok {
+			add(base+".name", "duplicate name %q, first defined at routes[%d]", rt.Name, first)
+		} else {
+			seen[rt.Name] = i
+		}
+
+		if rt.StripPrefix && rt.PathPrefix == "" {
+			add(base+".path_prefix", "strip_prefix requires a non-empty path_prefix")
+		}
+
+		u, err := url.Parse(rt.Upstream)
+		if err != nil {
+			add(base+".upstream", "cannot parse upstream: %v", err)
+			continue
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			add(base+".upstream", "scheme must be \"http\" or \"https\", got %q", u.Scheme)
+			continue
+		}
+
+		if u.Host == "" {
+			add(base+".upstream", "upstream must include a host")
+			continue
+		}
+
+		hostname := u.Hostname()
+		if ip := net.ParseIP(hostname); ip != nil {
+			allowed := ip.IsLoopback() || ip.IsPrivate() || cgnat.Contains(ip)
+			if !allowed {
+				add(base+".upstream", "non-private IP %s is not allowed", ip)
+			}
+		}
+
+		upPort := u.Port()
+		upPortNum := 0
+		if upPort == "" {
+			switch u.Scheme {
+			case "http":
+				upPortNum = 80
+			case "https":
+				upPortNum = 443
+			}
+		} else {
+			upPortNum, _ = strconv.Atoi(upPort)
+		}
+		if upPortNum == port {
+			self := false
+			if ip := net.ParseIP(hostname); ip != nil {
+				upIsLoopback := ip.IsLoopback() || ip.IsUnspecified()
+				self = upIsLoopback && listenCatchesLoopback
+			} else {
+				self = strings.EqualFold(hostname, "localhost") && listenCatchesLoopback
+			}
+
+			if self || hostname == host {
+				add(base+".upstream", "points to the gateway itself (%s), forms a loop",
+					net.JoinHostPort(hostname, strconv.Itoa(upPortNum)))
+			}
+
+		}
+	}
+
+}
+
+func (c *Config) validateTimeouts(add addFunc) {
+	type pd struct {
+		path string
+		dur  time.Duration
+	}
+
+	pds := []pd{
+		{"timeouts.dial", c.Timeouts.Dial},
+		{"timeouts.response_header", c.Timeouts.ResponseHeader},
+		{"timeouts.idle", c.Timeouts.Idle},
+		{"server.read_header", c.Server.ReadHeader},
+		{"server.write", c.Server.Write},
+		{"server.idle", c.Server.Idle},
+	}
+
+	for _, pd := range pds {
+		if pd.dur <= 0 {
+			add(pd.path, "must be > 0, got %s", pd.dur)
+		}
+	}
 }
 
 func (c *Config) Validate() []*FieldError {
@@ -129,65 +238,16 @@ func (c *Config) Validate() []*FieldError {
 		errs = append(errs, &FieldError{Path: path, Reason: fmt.Sprintf(format, a...)})
 	}
 
-	if c.Listen == "" {
-		add("listen", "The listen is empty")
-	}
-
-	host, portstr, err := net.SplitHostPort(c.Listen)
-	if err != nil {
-		add("listen", "The %q is illegal", c.Listen)
-	}
-
-	port, err := strconv.Atoi(portstr)
-	if err != nil {
-		add("listen", "The %q switch failed", portstr)
-	} else if port < 1 || port > 65535 {
-		add("listen", "The %q out of 1~65535", c.Listen)
-	}
-
-	if host == "" {
-		add("listen", "The %q must not 0.0.0.0", c.Listen)
-	}
-
-	if len(c.Routes) == 0 {
-		add("routes", "The routes is empty")
-	}
-
-	seen := make(map[string]int, len(c.Routes))
-	for i, rt := range c.Routes {
-		base := fmt.Sprintf("routes[%d]", i)
-
-		if rt.Name == "" {
-			add(base+".name", "The name must not be empty")
-		} else if first, ok := seen[rt.Name]; ok {
-			add(base+".name", "duplicate name %q,first at routes[%d]", rt.Name, first)
-		} else {
-			seen[rt.Name] = i
-		}
-
-		u, err := url.Parse(rt.Upstream)
-		if err != nil {
-			add(base+".upstream", "The %q upstream parse failed", rt.Name)
-			continue
-		}
-		if !strings.HasSuffix(u.Scheme, "http") && !strings.HasSuffix(u.Scheme, "https") {
-			add(base+".upstream", "The %q upstream scheme is illegal", rt.Name)
-			continue
-		}
-
-		if u.Host == "" {
-			add(base+".upstream", "The %q upstream host is illegal", rt.Name)
-			continue
-		}
-
-	}
+	listenHost, listenPort := c.validateListen(add)
+	c.validateRoutes(listenHost, listenPort, add)
+	c.validateTimeouts(add)
 
 	return errs
 }
 
 func Load(path string) (*Config, error) {
 	if path == "" {
-		return nil, errors.New("Path is empty")
+		return nil, errors.New("path is empty")
 	}
 
 	data, err := os.ReadFile(path)
@@ -202,16 +262,29 @@ func Load(path string) (*Config, error) {
 	}
 
 	idx := collectLines(&root)
-	_ = idx
 
-	data_io := bytes.NewReader(data)
-	dec := yaml.NewDecoder(data_io)
+	dataIo := bytes.NewReader(data)
+	dec := yaml.NewDecoder(dataIo)
 	dec.KnownFields(true)
 
 	var cfg Config
 	err = dec.Decode(&cfg)
-	if errors.Is(err, io.EOF) {
-		return nil, errors.New("Config is empty")
+	switch {
+	case errors.Is(err, io.EOF):
+		return nil, errors.New("config is empty")
+	case err != nil:
+		return nil, err
+	}
+
+	errs := cfg.Validate()
+	if len(errs) > 0 {
+		joined := make([]error, 0, len(errs))
+		for _, fe := range errs {
+			fe.File = path
+			fe.Line = idx[fe.Path]
+			joined = append(joined, fe)
+		}
+		return nil, errors.Join(joined...)
 	}
 
 	return &cfg, nil

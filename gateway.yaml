@@ -1,4 +1,4 @@
-listen: "0.0.0.0:8080"
+listen: "0.0.0.0:1314"
 
 timeouts:                        # B 侧：网关 → 上游
   dial: 3s
