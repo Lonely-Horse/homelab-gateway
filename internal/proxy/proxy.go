@@ -15,8 +15,9 @@ type Proxy struct {
 	rp    *httputil.ReverseProxy
 }
 
-type errorSetter interface {
+type errorSink interface {
 	SetError(msg string)
+	SetErrorReason(reason string)
 }
 
 func New(route *config.Route, t config.Timeouts, shared *http.Transport) *Proxy {
@@ -39,14 +40,18 @@ func New(route *config.Route, t config.Timeouts, shared *http.Transport) *Proxy 
 		},
 		Transport: shared,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			reason := ""
 			if errors.Is(err, context.DeadlineExceeded) {
 				http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+				reason = "timeout"
 			} else {
 				http.Error(w, "bad gateway", http.StatusBadGateway)
+				reason = "dial"
 			}
-			s, ok := w.(errorSetter)
+			s, ok := w.(errorSink)
 			if ok {
 				s.SetError(err.Error())
+				s.SetErrorReason(reason)
 			}
 
 		},
