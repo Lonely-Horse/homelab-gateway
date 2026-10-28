@@ -22,12 +22,17 @@ type Entry struct {
 
 type Recorder struct {
 	http.ResponseWriter
-	Status int
-	Bytes  int64
-	ErrMsg string
+	Status    int
+	Bytes     int64
+	ErrMsg    string
+	ErrReason string
 }
 
 func (r *Recorder) WriteHeader(code int) {
+	if code >= 100 && code < 200 {
+		r.ResponseWriter.WriteHeader(code)
+		return
+	}
 	if r.Status != 0 {
 		return
 	}
@@ -50,8 +55,17 @@ func (r *Recorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+var _ interface {
+	SetError(string)
+	SetErrorReason(string)
+} = (*Recorder)(nil)
+
 func (r *Recorder) SetError(msg string) {
 	r.ErrMsg = msg
+}
+
+func (r *Recorder) SetErrorReason(reason string) {
+	r.ErrReason = reason
 }
 
 func (r *Recorder) FinalStatus() int {

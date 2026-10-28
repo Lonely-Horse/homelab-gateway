@@ -63,7 +63,10 @@ func Run(cfg *config.Config) {
 			}
 			accesslog.Write(entry)
 
-			reason := wr.errReason
+			reason := wr.ErrReason
+			if reason == "" && wr.FinalStatus() >= 500 {
+				reason = "5xx"
+			}
 			m.Observe(routeName, wr.FinalStatus(), time.Since(start), reason)
 
 			if v == http.ErrAbortHandler {
