@@ -1,0 +1,41 @@
+[Unit]
+Description=homelab-gateway
+# TODO 1：两行，让它在网络就绪后启动
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+
+# TODO 2：非 root 用户（先 useradd --system --no-create-home gateway）
+User=lonelyhorse
+Group=lonelyhorse
+
+# TODO 3：绝对路径 + -cfgPath
+ExecStart=/usr/local/bin/gateway -cfgPath /etc/gateway/gateway.yaml
+
+# 崩溃自愈
+Restart=always
+RestartSec=2s
+
+# 日志：stdout→journal(info)、stderr→journal(err)
+StandardOutput=journal
+StandardError=journal
+
+# 加固
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=
+# TODO 4：这两行可选，但能让评分再降一点
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
