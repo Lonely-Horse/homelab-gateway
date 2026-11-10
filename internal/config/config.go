@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -131,6 +132,44 @@ func (c *Config) validateListen(add addFunc) (string, int) {
 	}
 
 	return listenHost, listenPort
+}
+
+func NormalizeHost(h string) string {
+	host := h
+	v, _, err := net.SplitHostPort(h)
+	if err == nil {
+		host = v
+	}
+
+	host = strings.ToLower(host)
+	host = strings.TrimSuffix(host, ".")
+	return host
+}
+
+func NormalizePrefix(p string) (string, error) {
+	if p == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "", errors.New("The Prefix isn't root")
+	}
+	if strings.Contains(p, "?") || strings.Contains(p, "#") || strings.Contains(p, "//") {
+		return "", errors.New("The host have illegal char")
+	}
+	var paths []string
+	paths = strings.Split(p, "/")
+	for _, path := range paths {
+		if path == ".." {
+			return "", errors.New("The path is illagel")
+		}
+	}
+
+	out := path.Clean(p)
+	if out == "/" {
+		return "", nil
+	}
+
+	return out, nil
 }
 
 func (c *Config) validateRoutes(host string, port int, add addFunc) {
